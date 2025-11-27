@@ -1,0 +1,719 @@
+
+{
+library(ggplot2)
+library(cowplot)
+
+
+## 全局设置：重复次数、每组样本大小、base measure
+N_rep  <- 100      # 在固定 w 下，重复生成 N_rep 组样本
+n_each <- 1000     # 每组样本大小
+rate0  <- 1/10      # base measure: Exp(rate0) ；这里是 Exp(1/5)，均值=5
+Mtheta = 20
+
+
+## Dirichlet 抽样函数
+rdirichlet <- function(n, alpha_vec) {
+  k <- length(alpha_vec)
+  X <- matrix(rgamma(n * k, shape = alpha_vec, rate = 1),
+              nrow = n, ncol = k, byrow = TRUE)
+  X / rowSums(X)
+}
+
+## 核心函数：给定 (alpha, theta) 生成图
+## M 由约束条件 M * theta = 20 自动确定
+make_plots_for_combo <- function(alpha, theta) {
+  ## 统一的最大 x 支持
+  max_x <- Mtheta
+  
+  ## 根据约束 M * theta = 20 计算 M（确保是整数）
+  M <- as.integer(max_x / theta)
+  
+  ## 1. 构造 G0(B_m) 并抽取一个固定的 w
+  breaks <- theta * 0:M
+  p_raw  <- diff(pexp(breaks, rate = rate0))
+  p_B    <- p_raw / sum(p_raw)
+  a_vec  <- alpha * p_B      # Dirichlet 参数
+  
+  set.seed(123)              # 为了复现，如果每个组合想有不同 seed，可以写在外面
+  w_fixed <- as.numeric(rdirichlet(1, a_vec))  # 长度 M
+  
+  ## 2. 图 1：固定 w 的直方图 + CDF
+  m_idx <- 1:M
+  t_m   <- m_idx * theta
+  F_t   <- cumsum(w_fixed)
+  
+  df_w <- data.frame(
+    m   = m_idx,
+    t   = t_m,
+    w   = w_fixed,
+    F_t = F_t
+  )
+  
+  fig_weight <- ggplot(df_w, aes(x = t)) +
+    geom_col(aes(y = w),
+             width = theta,
+             fill = "grey",
+             alpha = 0.7,
+             color = "grey30") +
+    geom_step(aes(y = F_t),
+              direction = "hv",
+              linewidth = 0.75,
+              color = "#B2182B") +
+    labs(
+      x = "",
+      y = "",
+      title = bquote(
+        "Weights"
+        ~ "," ~ alpha == .(alpha) * "," ~ theta == .(theta) * "," ~ M == .(M)
+      )
+    ) +
+    coord_cartesian(xlim = c(0, max_x)) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5)
+    )
+  
+  ## 3. 图 2：在固定 w 下，多组 Erlang mixture density + smooth CDF 的 median 和 95% CI (+ Exp(5))
+  ## 3.1 先生成 density 的矩阵
+  x_grid <- seq(0, max_x, length.out = 400)
+  G <- length(x_grid)
+  
+  dens_mat <- matrix(0, nrow = N_rep, ncol = G)
+  
+  for (i in 1:N_rep) {
+    z_idx  <- sample.int(M, size = n_each, replace = TRUE, prob = w_fixed)
+    t_data <- rgamma(n_each, shape = z_idx, scale = theta)
+    
+    dens <- density(t_data, from = 0, to = max_x, n = G)
+    dens_mat[i, ] <- dens$y   # dens$x 与 x_grid 一致（在 from/to 指定后）
+  }
+  
+  ## 3.2 基于 dens_mat 得到 smooth CDF 的矩阵（同一 x_grid 上积分）
+  dx <- diff(x_grid)[1]
+  cdf_mat <- t(apply(dens_mat, 1, function(y) {
+    F <- cumsum(y) * dx
+    pmin(F, 1)  # 数值误差截断
+  }))
+  
+  ## 3.3 对 density 和 CDF 都做 median + 2.5%/97.5% CI
+  dens_median <- apply(dens_mat, 2, median)
+  dens_q025   <- apply(dens_mat, 2, quantile, probs = 0.025)
+  dens_q975   <- apply(dens_mat, 2, quantile, probs = 0.975)
+  
+  cdf_median  <- apply(cdf_mat, 2, median)
+  cdf_q025    <- apply(cdf_mat, 2, quantile, probs = 0.025)
+  cdf_q975    <- apply(cdf_mat, 2, quantile, probs = 0.975)
+  
+  df_dens <- data.frame(
+    x      = x_grid,
+    median = dens_median,
+    q025   = dens_q025,
+    q975   = dens_q975
+  )
+  
+  df_cdf <- data.frame(
+    x      = x_grid,
+    median = cdf_median,
+    q025   = cdf_q025,
+    q975   = cdf_q975
+  )
+  
+  df_base <- data.frame(
+    x  = x_grid,
+    f0 = rate0 * exp(-rate0 * x_grid)
+  )
+  
+  ## 3.4 density + smooth CDF 画在同一张图上
+  fig_density <- ggplot(df_dens, aes(x = x)) +
+    ## density 的 95% credible band
+    geom_ribbon(
+      aes(ymin = q025, ymax = q975),
+      fill = "#F6B5B5",   # 淡红色 credible band（density）
+      alpha = 0.25
+    ) +
+    ## density 的 median
+    geom_line(
+      aes(y = median),
+      color = "#E64B35FF",   # 原来的红色
+      linewidth = 0.75
+    ) +
+    ## smooth CDF 的 95% credible band（稍微不同的红色系）
+    geom_ribbon(
+      data = df_cdf,
+      aes(x = x, ymin = q025, ymax = q975),
+      inherit.aes = FALSE,
+      fill = "#F4A6A6",      # 比上面略浅/略不同的红
+      alpha = 0.35
+    ) +
+    ## smooth CDF 的 median（深一点的红线）
+    geom_line(
+      data = df_cdf,
+      aes(x = x, y = median),
+      inherit.aes = FALSE,
+      color = "#B2182B",     # 和 density 的红区分开
+      linewidth = 0.8
+    ) +
+    ## base measure 的 density
+    geom_line(
+      data = df_base,
+      aes(x = x, y = f0),
+      color = "#4DBBD5FF",
+      linetype = "dashed",
+      linewidth = 1
+    ) +
+    labs(
+      x = "",
+      y = "",
+      title = bquote(
+        "Density & CDF"
+        ~ "," ~ alpha == .(alpha) * "," ~ theta == .(theta) * "," ~ M == .(M)
+      )
+    ) +
+    coord_cartesian(xlim = c(0, max_x), ylim = c(0, 1)) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5)
+    )
+  
+  ## 返回两个图的组合（上下排列一张大图）
+  combo <- plot_grid(fig_weight, fig_density, ncol = 1, align = "hv")
+  
+  list(
+    fig_weight  = fig_weight,
+    fig_density = fig_density,
+    combo       = combo
+  )
+}
+}
+## ---------------------------------------
+## 对所有 (alpha, theta) 组合批量生成
+## ---------------------------------------
+{
+alpha_vec <- c(1, 10)
+theta_vec <- c(0.1, 1)
+}
+
+{
+param_grid <- expand.grid(alpha = alpha_vec,
+                          theta = theta_vec)
+
+## 对每一行参数生成图
+all_plots <- lapply(seq_len(nrow(param_grid)), function(i) {
+  with(param_grid[i, ], {
+    make_plots_for_combo(alpha, theta)
+  })
+})
+
+## 给列表命名，方便索引（顺便把 M 也写进名字，方便 check）
+names(all_plots) <- apply(param_grid, 1, function(row) {
+  theta <- as.numeric(row["theta"])
+  M_val <- as.integer(Mtheta / theta)
+  paste0("alpha_", row["alpha"],
+         "_theta_", row["theta"],
+         "_M_", M_val)
+})
+{
+library(cowplot)
+## 举例：查看某个组合的图
+p1_combo = all_plots$alpha_1_theta_0.1_M_200$combo
+p2_combo = all_plots$alpha_10_theta_0.1_M_200$combo
+p3_combo = all_plots$alpha_1_theta_1_M_20$combo
+p4_combo = all_plots$alpha_10_theta_1_M_20$combo
+
+big_panel <- plot_grid(
+  p1_combo, p2_combo,
+  p3_combo, p4_combo,
+  ncol = 2,
+  labels = c(),
+  label_size = 10,
+  label_x = 0, label_y = 1
+)
+}
+}
+# 画出来
+big_panel
+
+################################
+## uncertainty under DP
+{
+library(ggplot2)
+
+plot_list   <- list()
+df_list     <- list()
+alpha_vals  <- c()
+theta_vals  <- c()
+M_vals      <- c()
+}
+
+{
+set.seed(2025)
+
+## ------------------------------
+## 0. Function for one configuration
+## ------------------------------
+simulate_DP_erlang <- function(alpha, theta, rate0 = 1/10,
+                               n_mix = 100, n_per_mix = 2000,
+                               x_min = 0, x_max = 20, n_grid = 512) {
+  
+  M <- 20 / theta      # because M * theta = 20
+  
+  ## --- 1. Construct Dirichlet parameters ---
+  breaks <- theta * 0:M
+  p_raw  <- diff(pexp(breaks, rate = rate0))
+  p_B    <- p_raw / sum(p_raw)
+  a_vec  <- alpha * p_B
+  
+  ## --- Dirichlet sampler ---
+  rdirichlet <- function(n, alpha_vec) {
+    k <- length(alpha_vec)
+    X <- matrix(rgamma(n * k, shape = alpha_vec, rate = 1),
+                nrow = n, ncol = k, byrow = TRUE)
+    X / rowSums(X)
+  }
+  
+  ## Erlang density
+  d_erlang <- function(x, k, theta) dgamma(x, shape = k, scale = theta)
+  
+  ## --- 2. simulate mixture densities ---
+  dens_mat <- matrix(NA_real_, nrow = n_mix, ncol = n_grid)
+  x_grid   <- NULL
+  
+  for (j in 1:n_mix) {
+    w <- as.numeric(rdirichlet(1, a_vec))
+    
+    comp_idx <- sample.int(M, size = n_per_mix, replace = TRUE, prob = w)
+    samples  <- rgamma(n_per_mix, shape = comp_idx, scale = theta)
+    
+    d <- density(samples, from = x_min, to = x_max, n = n_grid)
+    if (is.null(x_grid)) x_grid <- d$x
+    dens_mat[j, ] <- d$y
+  }
+  
+  ## --- 3. Mean + 95% credible interval ---
+  dens_mean  <- colMeans(dens_mat)
+  dens_lower <- apply(dens_mat, 2, quantile, probs = 0.025)
+  dens_upper <- apply(dens_mat, 2, quantile, probs = 0.975)
+  
+  ## Base measure G0
+  g0_density <- dexp(x_grid, rate = rate0)
+  
+  ## --- Output data frame ---
+  df_summary <- data.frame(
+    x = x_grid,
+    mean  = dens_mean,
+    lower = dens_lower,
+    upper = dens_upper,
+    g0    = g0_density
+  )
+  
+  return(df_summary)
+}
+}
+## ------------------------------
+## 4 Parameter sets (alpha × theta)
+## ------------------------------
+
+{
+alpha_set <- c(1, 10)
+theta_set <- c(0.2, 1)
+
+## ------------------------------
+## Step 1 — 先预计算 y_max & 保存各组合数据和 M
+## ------------------------------
+y_max <- 0
+idx   <- 1
+
+for (alpha in alpha_set) {
+  for (theta in theta_set) {
+    df_tmp <- simulate_DP_erlang(alpha, theta)
+    df_list[[idx]]    <- df_tmp
+    alpha_vals[idx]   <- alpha
+    theta_vals[idx]   <- theta
+    M_vals[idx]       <- 20 / theta          # 记录对应的 M
+    y_max <- max(y_max, df_tmp$upper, df_tmp$g0)
+    idx <- idx + 1
+  }
+}
+
+## ------------------------------
+## Step 2 — 生成四个图（标题含 α, θ, M；用 sqrt y 轴；统一上限）
+## ------------------------------
+plot_list <- list()
+
+for (k in 1:4) {
+  
+  df <- df_list[[k]]
+  
+  # 数学公式形式的标题：alpha, theta, M
+  title_expr <- bquote(
+    alpha == .(alpha_vals[k]) * "," ~~ 
+      theta == .(theta_vals[k]) * "," ~~ 
+      M == .(M_vals[k])
+  )
+  
+  p <- ggplot(df, aes(x = x)) +
+    geom_ribbon(aes(ymin = lower, ymax = upper),
+                fill = "#FFCCCC", alpha = 0.5) +
+    geom_line(aes(y = mean), color = "red", linewidth = 1.1) +
+    geom_line(aes(y = g0), color = "#66B2FF",
+              linetype = "dashed", linewidth = 1) +
+    scale_y_sqrt() +                       # sqrt y 轴
+    coord_cartesian(ylim = c(0, y_max)) +  # 上限统一
+    labs(
+      x = "x",
+      y = "sqrt(density)",
+      title = '',
+      subtitle = title_expr
+    ) +
+    theme_bw(base_size = 14)
+  
+  plot_list[[k]] <- p
+}
+}
+## ------------------------------
+## Step 3 — cowplot 排成 2×2
+## ------------------------------
+library(cowplot)
+
+final_plot <- cowplot::plot_grid(
+  plot_list[[1]], plot_list[[2]],
+  plot_list[[3]], plot_list[[4]],
+  ncol = 2,
+  labels = "AUTO"
+)
+
+final_plot
+
+
+
+#######################
+## ------------------------------
+## 0b. 权重的模拟 + 区间上的 mean & 95% CI
+## ------------------------------
+simulate_DP_weights <- function(alpha, theta, rate0 = 1/10,
+                                n_mix = 100) {
+  M <- 20 / theta
+  
+  # G0 在 partition 上的概率 G0(B_m)
+  breaks <- theta * 0:M
+  p_raw  <- diff(pexp(breaks, rate = rate0))
+  p_B    <- p_raw / sum(p_raw)      # length M
+  a_vec  <- alpha * p_B
+  
+  # Dirichlet 抽样
+  rdirichlet <- function(alpha_vec) {
+    k <- length(alpha_vec)
+    x <- rgamma(k, shape = alpha_vec, rate = 1)
+    x / sum(x)
+  }
+  
+  w_mat <- matrix(NA_real_, nrow = n_mix, ncol = M)
+  for (j in 1:n_mix) {
+    w_mat[j, ] <- rdirichlet(a_vec)
+  }
+  
+  w_mean  <- colMeans(w_mat)
+  w_lower <- apply(w_mat, 2, quantile, probs = 0.025)
+  w_upper <- apply(w_mat, 2, quantile, probs = 0.975)
+  
+  # 区间中点作为 x 轴位置
+  x_mid <- theta * ((1:M) - 0.5)
+  
+  data.frame(
+    x     = x_mid,
+    mean  = w_mean,
+    lower = w_lower,
+    upper = w_upper,
+    g0    = p_B          # base measure 的区间概率
+  )
+}
+
+## ==============================
+## Step 4 — weights 的 histogram + interval estimate
+## ==============================
+{
+w_df_list   <- list()
+w_plot_list <- list()
+w_y_max     <- 0
+idx         <- 1
+
+# 先对四个 (alpha, theta) 组合算出权重 summary，并找全局 y 上限
+for (alpha in alpha_set) {
+  for (theta in theta_set) {
+    df_w <- simulate_DP_weights(alpha, theta)
+    w_df_list[[idx]] <- df_w
+    w_y_max <- max(w_y_max, df_w$upper, df_w$g0)
+    idx <- idx + 1
+  }
+}
+
+# 再生成 4 张 histogram + CI 图
+for (k in 1:4) {
+  df_w <- w_df_list[[k]]
+  
+  title_expr <- bquote(
+    alpha == .(alpha_vals[k]) * "," ~
+      theta == .(theta_vals[k]) * "," ~
+      M == .(M_vals[k])
+  )
+  
+  p_w <- ggplot(df_w, aes(x = x)) +
+    # 柱状图：mean weight
+    geom_col(aes(y = mean),
+             fill = "#FFCCCC", color = NA) +
+    # 误差线：95% 区间
+    geom_errorbar(aes(ymin = lower, ymax = upper),
+                  width = 0, color = "red", linewidth = 0.4) +
+    # 可选：蓝色虚线 = G0(B_m)（如果不想看，可以把这一行注释掉）
+    geom_line(aes(y = g0),
+              color = "#66B2FF", linetype = "dashed", linewidth = 0.7) +
+    coord_cartesian(ylim = c(0, w_y_max)) +
+    labs(
+      x = "x (interval mid-point)",
+      y = "weight",
+      title = title_expr,
+      subtitle = ""
+    ) +
+    theme_bw(base_size = 14)
+  
+  w_plot_list[[k]] <- p_w
+}
+}
+library(cowplot)
+
+final_weight_plot <- cowplot::plot_grid(
+  w_plot_list[[1]], w_plot_list[[2]],
+  w_plot_list[[3]], w_plot_list[[4]],
+  ncol = 2,
+  labels = "AUTO"
+)
+
+final_weight_plot
+
+############################
+library(ggplot2)
+library(cowplot)
+{
+plot_list      <- list()
+df_dens_list   <- list()
+df_weight_list <- list()
+alpha_vals     <- c()
+theta_vals     <- c()
+M_vals         <- c()
+x_supp = 40
+set.seed(2025)
+}
+## ------------------------------------------------
+## 0. 同时模拟：密度 + 权重（共用同一批 Dirichlet 权重）
+## ------------------------------------------------
+{
+simulate_DP_both <- function(alpha, theta, rate0 = 1/10,
+                             n_mix = 100, n_per_mix = 1000,
+                             x_min = 0, x_max = x_supp, n_grid = 512) {
+  
+  M <- x_supp / theta      # because M * theta = 20
+  
+  ## --- 1. Construct Dirichlet parameters ---
+  breaks <- theta * 0:M
+  p_raw  <- diff(pexp(breaks, rate = rate0))
+  p_B    <- p_raw / sum(p_raw)        # G0(B_m)
+  a_vec  <- alpha * p_B
+  
+  ## --- Dirichlet sampler ---
+  rdirichlet <- function(alpha_vec) {
+    k <- length(alpha_vec)
+    x <- rgamma(k, shape = alpha_vec, rate = 1)
+    x / sum(x)
+  }
+  
+  ## --- 容器：density + weights ---
+  dens_mat <- matrix(NA_real_, nrow = n_mix, ncol = n_grid)
+  w_mat    <- matrix(NA_real_, nrow = n_mix, ncol = M)
+  x_grid   <- NULL
+  
+  ## --- 2. 对同一批 w 同时做：权重 + mixture 样本 ---
+  for (j in 1:n_mix) {
+    set.seed(j)
+    w <- rdirichlet(a_vec)       # 一次抽一整串权重
+    w_mat[j, ] <- w              # 存起来，后面做 weight summary
+    
+    comp_idx <- sample.int(M, size = n_per_mix, replace = TRUE, prob = w)
+    samples  <- rgamma(n_per_mix, shape = comp_idx, scale = theta)
+    
+    d <- density(samples, from = x_min, to = x_max, n = n_grid)
+    if (is.null(x_grid)) x_grid <- d$x
+    dens_mat[j, ] <- d$y
+  }
+  
+  ## --- 3a. 密度的 mean + 95% CI ---
+  dens_mean  <- colMeans(dens_mat)
+  dens_lower <- apply(dens_mat, 2, quantile, probs = 0.025)
+  dens_upper <- apply(dens_mat, 2, quantile, probs = 0.975)
+  g0_density <- dexp(x_grid, rate = rate0)
+  
+  df_dens <- data.frame(
+    x     = x_grid,
+    mean  = dens_mean,
+    lower = dens_lower,
+    upper = dens_upper,
+    g0    = g0_density
+  )
+  ## --- 3b. 权重的 mean + 95% CI + CDF mean + CDF 95% CI + G0 CDF ---
+  w_mean  <- colMeans(w_mat)
+  w_lower <- apply(w_mat, 2, quantile, probs = 0.025)
+  w_upper <- apply(w_mat, 2, quantile, probs = 0.975)
+  x_mid   <- theta * ((1:M) - 0.5)
+  
+  # 每一行权重做 cumsum 得到一条 CDF 曲线
+  cdf_mat <- t(apply(w_mat, 1, cumsum))
+  
+  # 对 CDF 按列求 mean 和 95% 区间
+  cdf_mean  <- colMeans(cdf_mat)
+  cdf_lower <- apply(cdf_mat, 2, quantile, probs = 0.025)
+  cdf_upper <- apply(cdf_mat, 2, quantile, probs = 0.975)
+  
+  # Base measure G0 的 CDF（同一条 Exp(10)）
+  g0_cdf <- pexp(x_mid, rate = rate0)
+  
+  df_weight <- data.frame(
+    x         = x_mid,
+    w_mean    = w_mean,
+    w_lower   = w_lower,
+    w_upper   = w_upper,
+    cdf_mean  = cdf_mean,
+    cdf_lower = cdf_lower,
+    cdf_upper = cdf_upper,
+    g0_cdf    = g0_cdf
+  )
+  
+  list(dens = df_dens, weight = df_weight)
+}
+
+## ------------------------------
+## 4 Parameter sets (alpha × theta)
+## ------------------------------
+alpha_set <- c(1, 10)
+theta_set <- c(0.1, 1)
+
+## ------------------------------
+## Step 1 — 对每个 (alpha, theta) 做一次联合模拟
+## ------------------------------
+y_max_dens <- 0
+y_max_w    <- 0
+idx        <- 1
+
+for (alpha in alpha_set) {
+  for (theta in theta_set) {
+    res <- simulate_DP_both(alpha, theta)   # ★ 同一次模拟
+    
+    df_dens_list[[idx]]   <- res$dens
+    df_weight_list[[idx]] <- res$weight
+    
+    alpha_vals[idx] <- alpha
+    theta_vals[idx] <- theta
+    M_vals[idx]     <- x_supp / theta
+    
+    y_max_dens <- max(y_max_dens, res$dens$upper, res$dens$g0)
+    y_max_w    <- max(y_max_w,    res$weight$upper, res$weight$g0)
+    
+    idx <- idx + 1
+  }
+}
+
+## ------------------------------
+## Step 2 — 生成四个 density 图（共用 y_max_dens）
+## ------------------------------
+dens_plot_list <- list()
+
+for (k in 1:4) {
+  df <- df_dens_list[[k]]
+  
+  subtitle_expr <- bquote(
+    alpha == .(alpha_vals[k]) * "," ~
+      theta == .(theta_vals[k]) * "," ~
+      M == .(M_vals[k])
+  )
+  
+  p <- ggplot(df, aes(x = x)) +
+    geom_ribbon(aes(ymin = lower, ymax = upper),
+                fill = "#FFCCCC", alpha = 0.5) +
+    geom_line(aes(y = mean), color = "red", linewidth = 1.1) +
+    geom_line(aes(y = g0),   color = "#66B2FF",
+              linetype = "dashed", linewidth = 1) +
+    scale_y_sqrt() +
+    coord_cartesian(ylim = c(0, y_max_dens)) +
+    labs(
+      x = "x",
+      y = "sqrt(density)",
+      title = "",
+      subtitle = subtitle_expr
+    ) +
+    theme_bw(base_size = 14)
+  
+  dens_plot_list[[k]] <- p
+}
+
+final_dens_plot <- cowplot::plot_grid(
+  dens_plot_list[[1]], dens_plot_list[[2]],
+  dens_plot_list[[3]], dens_plot_list[[4]],
+  ncol = 2,
+  labels = "AUTO"
+)
+}
+
+final_dens_plot
+
+## ------------------------------
+## Step 3 — 生成四个 weight histogram + CDF 图
+## ------------------------------
+{
+weight_plot_list <- list()
+
+for (k in 1:4) {
+  df_w <- df_weight_list[[k]]
+  
+  title_expr <- bquote(
+    alpha == .(alpha_vals[k]) * "," ~
+      theta == .(theta_vals[k]) * "," ~
+      M == .(M_vals[k])
+  )
+  
+  p_w <- ggplot(df_w, aes(x = x)) +
+    # 1) 柱状图：mean weight
+    geom_col(aes(y = w_mean),
+             fill = "#FFCCCC", color = NA) +
+    # 2) 误差线：weight 的 95% 区间
+    geom_errorbar(aes(ymin = w_lower, ymax = w_upper),
+                  width = 0, color = "red", linewidth = 0.4) +
+    # 3) CDF 的 95% 区间带（灰色 or 淡色带）
+    geom_ribbon(aes(ymin = cdf_lower, ymax = cdf_upper),
+                alpha = 0.2, fill = "grey70") +
+    # 4) CDF mean（黑线）
+    geom_line(aes(y = cdf_mean),
+              linewidth = 0.8, color = "black") +
+    # 5) Base measure G0 的 CDF（蓝色虚线）
+    geom_line(aes(y = g0_cdf),
+              linewidth = 0.8, color = "#66B2FF", linetype = "dashed") +
+    coord_cartesian(ylim = c(0, 1)) +   # weight & CDF 都在 [0,1]
+    labs(
+      x = "x (interval mid-point)",
+      y = "weight / CDF",
+      title = title_expr,
+      subtitle = ""
+    ) +
+    theme_bw(base_size = 14)
+  
+  weight_plot_list[[k]] <- p_w
+}
+
+final_weight_plot <- cowplot::plot_grid(
+  weight_plot_list[[1]], weight_plot_list[[2]],
+  weight_plot_list[[3]], weight_plot_list[[4]],
+  ncol = 2,
+  labels = "AUTO"
+)
+}
+final_weight_plot
+
+
+
