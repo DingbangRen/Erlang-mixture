@@ -1,0 +1,1061 @@
+## ======================================================
+## 0. 基本设置 & 加载包
+## ======================================================
+library(ggplot2)
+library(cowplot)
+
+set.seed(123)
+
+## base measure: Exp(rate0)，以及 Mtheta = M * theta
+rate0  <- 1/10    # 指数分布 rate（均值 = 10）
+Mtheta <- 40      # partition 的最大坐标：M * theta = 40
+
+## ======================================================
+## 1. Dirichlet 抽样函数
+## ======================================================
+rdirichlet <- function(n, alpha_vec) {
+  k <- length(alpha_vec)
+  X <- matrix(rgamma(n * k, shape = alpha_vec, rate = 1),
+              nrow = n, ncol = k, byrow = TRUE)
+  X / rowSums(X)
+}
+
+## ======================================================
+## 2. 构造 2D Dirichlet 权重
+##    B_(m1,m2) = ((m1-1)θ, m1θ] × ((m2-1)θ, m2θ]
+##    base measure = Exp(rate0) ⊗ Exp(rate0)
+## ======================================================
+make_2d_weights <- function(alpha, theta, rate0, Mtheta) {
+  max_x <- Mtheta
+  M     <- as.integer(max_x / theta)  # 保证 M * theta = Mtheta
+  
+  ## 一维区间概率 G0(B_m)
+  breaks <- theta * 0:M
+  p_raw  <- diff(pexp(breaks, rate = rate0))
+  p_1d   <- p_raw / sum(p_raw)        # 长度 M
+  
+  ## 二维 product measure：P(B_(m1,m2)) = p_1d[m1] * p_1d[m2]
+  p_2d_mat <- outer(p_1d, p_1d, "*")  # M x M
+  p_2d_vec <- as.vector(p_2d_mat)     # 长度 M^2
+  
+  ## Dirichlet 参数 & 抽样
+  a_vec <- alpha * p_2d_vec
+  w_vec <- as.numeric(rdirichlet(1, a_vec))
+  
+  W_mat <- matrix(w_vec, nrow = M, ncol = M, byrow = TRUE)
+  
+  list(M = M, theta = theta, W_mat = W_mat)
+}
+
+## ======================================================
+## 3. 从二维 Erlang mixture 采样
+##    f(x1,x2) = Σ_{m1,m2} w_{m1,m2} Ga(x1; m1,θ) Ga(x2; m2,θ)
+## ======================================================
+r_erlang_mix_2d <- function(n, W_list) {
+  M     <- W_list$M
+  theta <- W_list$theta
+  W_mat <- W_list$W_mat
+  
+  w_vec <- as.vector(W_mat)
+  K     <- length(w_vec)
+  
+  ## 抽组件索引
+  k_idx <- sample.int(K, size = n, replace = TRUE, prob = w_vec)
+  
+  ## 解码成 (m1, m2) （对应 byrow=TRUE）
+  m1 <- ((k_idx - 1) %% M) + 1
+  m2 <- ((k_idx - 1) %/% M) + 1
+  
+  x1 <- rgamma(n, shape = m1, scale = theta)
+  x2 <- rgamma(n, shape = m2, scale = theta)
+  
+  data.frame(x1 = x1, x2 = x2)
+}
+
+## ======================================================
+## 4. 主函数：make_2d_panel()
+##    生成一张：
+##    上：X1 边际直方图 + 密度；下：2D contour + X2 直方图
+##    要求：
+##      - 边际直方图 binwidth = theta
+##      - 上面的图宽度 = 下面 heatmap 宽度
+## ======================================================
+make_2d_panel <- function(alpha,
+                          theta,
+                          n_samp = 2000,
+                          rate0  = 1/10,
+                          Mtheta = 40) {
+  
+  ## ---- 4.1 生成 2D 权重和样本 ----
+  W_2d <- make_2d_weights(alpha, theta, rate0, Mtheta)
+  df   <- r_erlang_mix_2d(n_samp, W_2d)
+  
+  x1_lim <- c(0, Mtheta)
+  x2_lim <- c(0, Mtheta)
+  
+  ## 方便后面写 label
+  M_val <- W_2d$M
+  
+  ## 统一的 plot margin
+  uniform_margin <- theme(
+    plot.margin = margin(t = 5, r = 5, b = 5, l = 5)
+  )
+  
+  ## ---- 中间主图 ----
+  p_main <- ggplot(df, aes(x = x1, y = x2)) +
+    stat_density_2d(
+      aes(fill = after_stat(level)),
+      geom  = "polygon",
+      alpha = 0.40,
+      colour = NA
+    ) +
+    scale_fill_gradient(low = "lightyellow", high = "orange") +
+    stat_density_2d(
+      colour    = "red",
+      linewidth = 0.4
+    ) +
+    geom_point(size = 0.35, alpha = 0.35) +
+    coord_cartesian(xlim = x1_lim, ylim = x2_lim) +
+    labs(x = expression(X[1]), y = expression(X[2])) +
+    theme_minimal() +
+    theme(legend.position = "none") +
+    uniform_margin
+  
+  ## ---- 顶部边际 ----
+  x_grid1  <- seq(x1_lim[1], x1_lim[2], length.out = 400)
+  df_base1 <- data.frame(
+    x = x_grid1,
+    f0 = rate0 * exp(-rate0 * x_grid1)
+  )
+  dens1   <- density(df$x1, from = x1_lim[1], to = x1_lim[2])
+  df_fit1 <- data.frame(x = dens1$x, f = dens1$y)
+  
+  p_top <- ggplot(df, aes(x = x1)) +
+    geom_histogram(
+      aes(y = after_stat(density)),
+      binwidth = theta,
+      fill = "cyan",
+      color = "black"
+    ) +
+    geom_line(
+      data = df_base1,
+      aes(x = x, y = f0),
+      colour   = "blue",
+      linewidth = 0.8
+    ) +
+    geom_line(
+      data = df_fit1,
+      aes(x = x, y = f),
+      colour   = "red",
+      linewidth = 0.8
+    ) +
+    coord_cartesian(xlim = x1_lim) +
+    labs(x = NULL, y = "density") +
+    theme_minimal() +
+    theme(
+      axis.title.x = element_blank(),
+      axis.text.x  = element_blank(),
+      axis.ticks.x = element_blank()
+    ) +
+    uniform_margin
+  
+  ## ---- 右侧边际 ----
+  x_grid2  <- seq(x2_lim[1], x2_lim[2], length.out = 400)
+  df_base2 <- data.frame(
+    x = x_grid2,
+    f0 = rate0 * exp(-rate0 * x_grid2)
+  )
+  dens2   <- density(df$x2, from = x2_lim[1], to = x2_lim[2])
+  df_fit2 <- data.frame(x = dens2$x, f = dens2$y)
+  
+  p_right <- ggplot(df, aes(x = x2)) +
+    geom_histogram(
+      aes(y = after_stat(density)),
+      binwidth = theta,
+      fill = "cyan",
+      color = "black"
+    ) +
+    geom_line(
+      data = df_base2,
+      aes(x = x, y = f0),
+      colour   = "blue",
+      linewidth = 0.8
+    ) +
+    geom_line(
+      data = df_fit2,
+      aes(x = x, y = f),
+      colour   = "red",
+      linewidth = 0.8
+    ) +
+    coord_flip(xlim = x2_lim) +
+    labs(x = NULL, y = "density") +
+    theme_minimal() +
+    theme(
+      axis.title.y = element_blank(),
+      axis.text.y  = element_blank(),
+      axis.ticks.y = element_blank()
+    ) +
+    uniform_margin
+  
+  
+  # 数学负号：把普通 "-" 换成数学负号 "−"
+  minus <- "−"
+  fmt_num <- function(x) gsub("-", minus, as.character(x))
+  
+  label_txt <- sprintf(
+    "alpha==%s * \",\" ~~ theta==%s * \",\" ~~ M==%s",
+    fmt_num(alpha),
+    fmt_num(theta),
+    fmt_num(M_val)
+  )
+  
+  blank <- ggplot() +
+    xlim(0,1) + ylim(0,1) +
+    annotate(
+      "text",
+      x = 0.5, y = 0.5,
+      label = label_txt,
+      parse = TRUE,
+      size  = 3,      # ★ 缩小字体
+      hjust = 0.5,
+      vjust = 0.5
+    ) +
+    theme_void() +
+    uniform_margin
+  
+  ## ---- 布局 ----
+  top_row <- plot_grid(
+    p_top, blank,
+    ncol = 2,
+    rel_widths = c(0.8, 0.2),
+    align = "h"
+  )
+  
+  bottom_row <- plot_grid(
+    p_main, p_right,
+    ncol = 2,
+    rel_widths = c(0.8, 0.2),
+    align = "h"
+  )
+  
+  final_panel <- plot_grid(
+    top_row,
+    bottom_row,
+    ncol = 1,
+    rel_heights = c(0.25, 0.75),
+    align = "v"
+  )
+  
+  final_panel
+}
+
+
+## ============================================
+
+set.seed(11)
+(p1 <- make_2d_panel(alpha = 1,  theta = 0.2))
+
+set.seed(21)
+(p2 <- make_2d_panel(alpha = 10, theta = 0.2))
+set.seed(31)
+(p3 <- make_2d_panel(alpha = 1,  theta = 1))
+set.seed(41)
+(p4 <- make_2d_panel(alpha = 10, theta = 1))
+
+
+###########################################
+## general
+## -------------------------------------------------
+## 1. General 版本：构造 2D Dirichlet 权重
+##    维度 1: (0, M1_theta], 维度 2: (0, M2_theta]
+## -------------------------------------------------
+make_2d_weights_general <- function(alpha, theta,
+                                    rate0,
+                                    M1_theta = 20,
+                                    M2_theta = 40) {
+  ## 计算 M1, M2
+  M1 <- as.integer(M1_theta / theta)
+  M2 <- as.integer(M2_theta / theta)
+  
+  ## 一维 breaks
+  breaks1 <- theta * 0:M1
+  breaks2 <- theta * 0:M2
+  
+  ## 指数分布在各区间上的概率
+  p1_raw <- diff(pexp(breaks1, rate = rate0))  # 长度 M1
+  p2_raw <- diff(pexp(breaks2, rate = rate0))  # 长度 M2
+  
+  ## 2D product measure，在矩形上再归一化一次
+  p2d_raw <- outer(p1_raw, p2_raw, "*")        # M1 x M2
+  p_vec   <- as.vector(p2d_raw)
+  p_vec   <- p_vec / sum(p_vec)                # 长度 M1*M2
+  
+  ## Dirichlet 参数与抽样
+  a_vec <- alpha * p_vec
+  w_vec <- as.numeric(rdirichlet(1, a_vec))
+  
+  W_mat <- matrix(w_vec, nrow = M1, ncol = M2, byrow = TRUE)
+  
+  list(M1 = M1, M2 = M2, theta = theta, W = W_mat)
+}
+
+## -------------------------------------------------
+## 2. General 版本：从 2D Erlang mixture 中采样
+## -------------------------------------------------
+r_erlang_mix_2d_general <- function(n, W_list) {
+  M1    <- W_list$M1
+  M2    <- W_list$M2
+  theta <- W_list$theta
+  W     <- W_list$W
+  
+  w_vec <- as.vector(W)
+  K     <- length(w_vec)
+  
+  k_idx <- sample.int(K, size = n, replace = TRUE, prob = w_vec)
+  
+  ## 通过 M1 解码 (m1, m2)
+  m1 <- ((k_idx - 1) %% M1) + 1
+  m2 <- ((k_idx - 1) %/% M1) + 1
+  
+  x1 <- rgamma(n, shape = m1, scale = theta)
+  x2 <- rgamma(n, shape = m2, scale = theta)
+  
+  data.frame(x1 = x1, x2 = x2)
+}
+## -------------------------------------------------
+make_weight_heatmap <- function(W_list, M1_theta, M2_theta) {
+  W     <- W_list$W
+  M1    <- W_list$M1
+  M2    <- W_list$M2
+  theta <- W_list$theta
+  
+  ## 构造 tile dataframe
+  df_w <- expand.grid(
+    m1 = 1:M1,
+    m2 = 1:M2
+  )
+  df_w$w <- as.vector(W)
+  
+  ## tile 的实际坐标
+  df_w$xmin <- (df_w$m1 - 1) * theta
+  df_w$xmax <- df_w$m1 * theta
+  df_w$ymin <- (df_w$m2 - 1) * theta
+  df_w$ymax <- df_w$m2 * theta
+  
+  ratio_yx <- M2_theta / M1_theta
+  
+  ## 颜色逻辑：白色为背景，正权重使用渐变色
+  ## scale_fill_gradientn + values 确保 0 对应白色
+  p_w <- ggplot(df_w) +
+    geom_rect(
+      aes(xmin = xmin, xmax = xmax,
+          ymin = ymin, ymax = ymax,
+          fill = w),
+      color = "white", linewidth = 0.2
+    ) +
+    scale_fill_gradientn(
+      colours = c("white", viridisLite::viridis(5)),
+      values  = scales::rescale(c(0, max(df_w$w))),
+      limits  = c(0, max(df_w$w)),
+      name    = "weight"
+    ) +
+    coord_fixed(
+      ratio = ratio_yx,
+      xlim  = c(0, M1_theta),
+      ylim  = c(0, M2_theta),
+      expand = FALSE
+    ) +
+    labs(
+      x = expression(m[1]*theta),
+      y = expression(m[2]*theta)
+    ) +
+    theme_minimal(base_size = 10) +
+    theme(
+      plot.margin = margin(5, 5, 5, 5),
+      panel.background = element_rect(fill = "white", color = NA)
+    )
+  
+  p_w
+}
+
+
+## -------------------------------------------------
+## 3. 主函数：make_2d_panel_general()
+##    asymmetric support + 完整 panel 布局
+## -------------------------------------------------
+make_2d_panel_general <- function(alpha,
+                                  theta,
+                                  n_samp   = 5000,
+                                  rate0    = 1/10,   # Exp(rate0)
+                                  M1_theta = 20,     # 维度1: (0, M1_theta]
+                                  M2_theta = 40) {   # 维度2: (0, M2_theta]
+  
+  ## 1. 生成 2D 权重和样本
+  W_2d <- make_2d_weights_general(alpha, theta, rate0,
+                                  M1_theta = M1_theta,
+                                  M2_theta = M2_theta)
+  df   <- r_erlang_mix_2d_general(n_samp, W_2d)
+  
+  M1 <- W_2d$M1
+  M2 <- W_2d$M2
+  
+  x1_lim <- c(0, M1_theta)
+  x2_lim <- c(0, M2_theta)
+  
+  ratio_yx <- (x2_lim[2] - x2_lim[1]) / (x1_lim[2] - x1_lim[1])  # = M2_theta / M1_theta
+  
+  ## 统一 margin
+  uniform_margin <- theme(
+    plot.margin = margin(t = 5, r = 5, b = 5, l = 5)
+  )
+  
+  ## 2. 中间主图：scatter + 2D density (coord_fixed 保证真实比例)
+  p_main <- ggplot(df, aes(x = x1, y = x2)) +
+    stat_density_2d(
+      aes(fill = after_stat(level)),
+      geom  = "polygon",
+      alpha = 0.40,
+      colour = NA
+    ) +
+    scale_fill_gradient(low = "lightyellow", high = "orange") +
+    stat_density_2d(
+      colour    = "red",
+      linewidth = 0.4
+    ) +
+    geom_point(size = 0.35, alpha = 0.35) +
+    coord_fixed(
+      ratio = ratio_yx,
+      xlim  = x1_lim,
+      ylim  = x2_lim
+    ) +
+    labs(x = expression(X[1]), y = expression(X[2])) +
+    theme_minimal() +
+    theme(
+      legend.position = "none"
+    ) +
+    uniform_margin
+  
+  ## 3. 顶部 X1 边际
+  x_grid1  <- seq(x1_lim[1], x1_lim[2], length.out = 400)
+  df_base1 <- data.frame(
+    x = x_grid1,
+    f0 = rate0 * exp(-rate0 * x_grid1)
+  )
+  dens1   <- density(df$x1, from = x1_lim[1], to = x1_lim[2])
+  df_fit1 <- data.frame(x = dens1$x, f = dens1$y)
+  
+  p_top <- ggplot(df, aes(x = x1)) +
+    geom_histogram(
+      aes(y = after_stat(density)),
+      binwidth = theta,
+      fill = "cyan",
+      color = "black"
+    ) +
+    geom_line(
+      data = df_base1,
+      aes(x = x, y = f0),
+      colour   = "blue",
+      linewidth = 0.8
+    ) +
+    geom_line(
+      data = df_fit1,
+      aes(x = x, y = f),
+      colour   = "red",
+      linewidth = 0.8
+    ) +
+    coord_cartesian(xlim = x1_lim) +
+    labs(x = NULL, y = "density") +
+    theme_minimal() +
+    theme(
+      axis.title.x = element_blank(),
+      axis.text.x  = element_blank(),
+      axis.ticks.x = element_blank()
+    ) +
+    uniform_margin
+  
+  ## 4. 右侧 X2 边际
+  x_grid2  <- seq(x2_lim[1], x2_lim[2], length.out = 400)
+  df_base2 <- data.frame(
+    x = x_grid2,
+    f0 = rate0 * exp(-rate0 * x_grid2)
+  )
+  dens2   <- density(df$x2, from = x2_lim[1], to = x2_lim[2])
+  df_fit2 <- data.frame(x = dens2$x, f = dens2$y)
+  
+  p_right <- ggplot(df, aes(x = x2)) +
+    geom_histogram(
+      aes(y = after_stat(density)),
+      binwidth = theta,
+      fill = "cyan",
+      color = "black"
+    ) +
+    geom_line(
+      data = df_base2,
+      aes(x = x, y = f0),
+      colour   = "blue",
+      linewidth = 0.8
+    ) +
+    geom_line(
+      data = df_fit2,
+      aes(x = x, y = f),
+      colour   = "red",
+      linewidth = 0.8
+    ) +
+    coord_flip(xlim = x2_lim) +
+    labs(x = NULL, y = "density") +
+    theme_minimal() +
+    theme(
+      axis.title.y = element_blank(),
+      axis.text.y  = element_blank(),
+      axis.ticks.y = element_blank()
+    ) +
+    uniform_margin
+  
+  ## 5. 右上角参数注释（横排，小字体）
+  minus <- "−"
+  fmt_num <- function(x) gsub("-", minus, as.character(x))
+  
+  label_txt <- sprintf(
+    "alpha==%s*\",\"~~theta==%s*\",\"~~M[1]==%s*\",\"~~M[2]==%s",
+    fmt_num(alpha),
+    fmt_num(theta),
+    fmt_num(M1),
+    fmt_num(M2)
+  )
+  
+  blank <- ggplot() +
+    xlim(0,1) + ylim(0,1) +
+    annotate(
+      "text",
+      x = 0.5, y = 0.5,
+      label = label_txt,
+      parse = TRUE,
+      size  = 3,
+      hjust = 0.5,
+      vjust = 0.5
+    ) +
+    theme_void() +
+    uniform_margin
+  
+  ## 6. 上下布局（不包含 heatmap）
+  top_row <- plot_grid(
+    p_top, blank,
+    ncol = 2,
+    rel_widths = c(0.8, 0.2),
+    align = "h",
+    axis  = "tb"
+  )
+  
+  bottom_row <- plot_grid(
+    p_main, p_right,
+    ncol = 2,
+    rel_widths = c(0.8, 0.2),
+    align = "h",
+    axis  = "tb"
+  )
+  
+  final_panel <- plot_grid(
+    top_row,
+    bottom_row,
+    ncol = 1,
+    rel_heights = c(0.25, 0.75),
+    align = "v",
+    axis  = "lr"
+  )
+  
+  ## 7. 单独生成 weight heatmap
+  p_w <- make_weight_heatmap(
+    W_list   = W_2d,
+    M1_theta = M1_theta,
+    M2_theta = M2_theta
+  )
+  
+  ## 8. 返回两个图
+  list(
+    final_panel    = final_panel,
+    weight_heatmap = p_w
+  )
+}
+
+res <- make_2d_panel_general(
+  alpha    = 1,
+  theta    = 1,
+  n_samp   = 2000,
+  rate0    = 1/10,
+  M1_theta = 40,
+  M2_theta = 40
+)
+
+# 主图（marginals + scatter）
+res$final_panel
+
+# 单独的 weight heatmap
+res$weight_heatmap
+
+########################
+
+## 自定义base measure
+
+## 使用自定义 base CDF 构造 2D Dirichlet 权重
+make_2d_weights_general_base <- function(alpha, theta,
+                                         base_cdf1, base_cdf2,
+                                         M1_theta = 20,
+                                         M2_theta = 40) {
+  M1 <- as.integer(M1_theta / theta)
+  M2 <- as.integer(M2_theta / theta)
+  
+  breaks1 <- theta * 0:M1
+  breaks2 <- theta * 0:M2
+  
+  ## 一维区间概率：G1(I^{(1)}_m1) = F1(m1θ) - F1((m1-1)θ)
+  p1_raw <- diff(base_cdf1(breaks1))   # 长度 M1
+  p2_raw <- diff(base_cdf2(breaks2))   # 长度 M2
+  
+  ## 2D product measure，在矩形上归一化
+  p2d_raw <- outer(p1_raw, p2_raw, "*")  # M1 x M2
+  p_vec   <- as.vector(p2d_raw)
+  p_vec   <- p_vec / sum(p_vec)
+  
+  a_vec <- alpha * p_vec
+  w_vec <- as.numeric(rdirichlet(1, a_vec))
+  
+  W_mat <- matrix(w_vec, nrow = M1, ncol = M2, byrow = TRUE)
+  
+  list(M1 = M1, M2 = M2, theta = theta, W = W_mat)
+}
+
+make_weight_heatmap <- function(W_list, M1_theta, M2_theta, alpha) {
+  W     <- W_list$W
+  M1    <- W_list$M1
+  M2    <- W_list$M2
+  theta <- W_list$theta
+  
+  df_w <- expand.grid(
+    m1 = 1:M1,
+    m2 = 1:M2
+  )
+  df_w$w <- as.vector(W)
+  
+  df_w$xmin <- (df_w$m1 - 1) * theta
+  df_w$xmax <- df_w$m1 * theta
+  df_w$ymin <- (df_w$m2 - 1) * theta
+  df_w$ymax <- df_w$m2 * theta
+  
+  ratio_yx <- M2_theta / M1_theta
+  
+  ## 数学负号 & 数字格式
+  minus   <- "−"
+  fmt_num <- function(x) gsub("-", minus, as.character(x))
+  
+  label_txt <- sprintf(
+    "alpha==%s*\",\"~~theta==%s*\",\"~~M[1]==%s*\",\"~~M[2]==%s",
+    fmt_num(alpha),
+    fmt_num(theta),
+    fmt_num(M1),
+    fmt_num(M2)
+  )
+  
+  p_w <- ggplot(df_w) +
+    geom_rect(
+      aes(xmin = xmin, xmax = xmax,
+          ymin = ymin, ymax = ymax,
+          fill = w),
+      color = "white", linewidth = 0.2
+    ) +
+    scale_fill_gradientn(
+      colours = c("white", viridisLite::viridis(5)),
+      values  = scales::rescale(c(0, max(df_w$w))),
+      limits  = c(0, max(df_w$w)),
+      name    = "weight"
+    ) +
+    ## 在右上角写参数
+    annotate(
+      "text",
+      x     = M1_theta * 0.95,
+      y     = M2_theta * 0.95,
+      label = label_txt,
+      parse = TRUE,
+      hjust = 1,
+      vjust = 1,
+      size  = 3
+    ) +
+    coord_fixed(
+      ratio = ratio_yx,
+      xlim  = c(0, M1_theta),
+      ylim  = c(0, M2_theta),
+      expand = FALSE
+    ) +
+    labs(x = expression(m[1]*theta),
+         y = expression(m[2]*theta)) +
+    theme_minimal(base_size = 10) +
+    theme(
+      plot.margin      = margin(5, 5, 5, 5),
+      panel.background = element_rect(fill = "white", color = NA)
+    )
+  
+  p_w
+}
+
+make_2d_panel_general_freebase <- function(alpha,
+                                  theta,
+                                  n_samp   = 5000,
+                                  M1_theta = 20,
+                                  M2_theta = 40,
+                                  ## 默认 base measure: Exp(rate0)
+                                  rate0    = 1/10,
+                                  ## 可选：自定义 base measure
+                                  base_cdf1,
+                                  base_cdf2,
+                                  base_pdf1,
+                                  base_pdf2) {
+  
+  ## ---------- 0. 处理 base 函数（默认用 Exp(rate0)） ----------
+  if (missing(base_cdf1)) {
+    base_cdf1 <- function(x) pexp(x, rate = rate0)
+  }
+  if (missing(base_cdf2)) {
+    base_cdf2 <- base_cdf1
+  }
+  if (missing(base_pdf1)) {
+    base_pdf1 <- function(x) dexp(x, rate = rate0)
+  }
+  if (missing(base_pdf2)) {
+    base_pdf2 <- base_pdf1
+  }
+  
+  ## ---------- 1. 权重和样本 ----------
+  W_2d <- make_2d_weights_general_base(
+    alpha     = alpha,
+    theta     = theta,
+    base_cdf1 = base_cdf1,
+    base_cdf2 = base_cdf2,
+    M1_theta  = M1_theta,
+    M2_theta  = M2_theta
+  )
+  
+  df <- r_erlang_mix_2d_general(n_samp, W_2d)
+  
+  M1 <- W_2d$M1
+  M2 <- W_2d$M2
+  
+  x1_lim <- c(0, M1_theta)
+  x2_lim <- c(0, M2_theta)
+  
+  ratio_yx <- (x2_lim[2] - x2_lim[1]) / (x1_lim[2] - x1_lim[1])
+  
+  uniform_margin <- theme(
+    plot.margin = margin(t = 5, r = 5, b = 5, l = 5)
+  )
+  
+  ## ---------- 2. 中间 scatter + 2D density ----------
+  p_main <- ggplot(df, aes(x = x1, y = x2)) +
+    stat_density_2d(
+      aes(fill = after_stat(level)),
+      geom  = "polygon",
+      alpha = 0.40,
+      colour = NA
+    ) +
+    scale_fill_gradient(low = "lightyellow", high = "orange") +
+    stat_density_2d(
+      colour    = "red",
+      linewidth = 0.4
+    ) +
+    geom_point(size = 0.35, alpha = 0.35) +
+    coord_fixed(
+      ratio = ratio_yx,
+      xlim  = x1_lim,
+      ylim  = x2_lim
+    ) +
+    labs(x = expression(X[1]), y = expression(X[2])) +
+    theme_minimal() +
+    theme(legend.position = "none") +
+    uniform_margin
+  
+  ## ---------- 3. 顶部 X1 边际 ----------
+  x_grid1  <- seq(x1_lim[1], x1_lim[2], length.out = 400)
+  df_base1 <- data.frame(
+    x = x_grid1,
+    f0 = base_pdf1(x_grid1)
+  )
+  dens1   <- density(df$x1, from = x1_lim[1], to = x1_lim[2])
+  df_fit1 <- data.frame(x = dens1$x, f = dens1$y)
+  
+  p_top <- ggplot(df, aes(x = x1)) +
+    geom_histogram(
+      aes(y = after_stat(density)),
+      binwidth = theta,
+      fill = "cyan",
+      color = "black"
+    ) +
+    geom_line(
+      data = df_base1,
+      aes(x = x, y = f0),
+      colour   = "blue",
+      linewidth = 0.8
+    ) +
+    geom_line(
+      data = df_fit1,
+      aes(x = x, y = f),
+      colour   = "red",
+      linewidth = 0.8
+    ) +
+    coord_cartesian(xlim = x1_lim) +
+    labs(x = NULL, y = "density") +
+    theme_minimal() +
+    theme(
+      axis.title.x = element_blank(),
+      axis.text.x  = element_blank(),
+      axis.ticks.x = element_blank()
+    ) +
+    uniform_margin
+  
+  ## ---------- 4. 右侧 X2 边际 ----------
+  x_grid2  <- seq(x2_lim[1], x2_lim[2], length.out = 400)
+  df_base2 <- data.frame(
+    x = x_grid2,
+    f0 = base_pdf2(x_grid2)
+  )
+  dens2   <- density(df$x2, from = x2_lim[1], to = x2_lim[2])
+  df_fit2 <- data.frame(x = dens2$x, f = dens2$y)
+  
+  p_right <- ggplot(df, aes(x = x2)) +
+    geom_histogram(
+      aes(y = after_stat(density)),
+      binwidth = theta,
+      fill = "cyan",
+      color = "black"
+    ) +
+    geom_line(
+      data = df_base2,
+      aes(x = x, y = f0),
+      colour   = "blue",
+      linewidth = 0.8
+    ) +
+    geom_line(
+      data = df_fit2,
+      aes(x = x, y = f),
+      colour   = "red",
+      linewidth = 0.8
+    ) +
+    coord_flip(xlim = x2_lim) +
+    labs(x = NULL, y = "density") +
+    theme_minimal() +
+    theme(
+      axis.title.y = element_blank(),
+      axis.text.y  = element_blank(),
+      axis.ticks.y = element_blank()
+    ) +
+    uniform_margin
+  
+  ## ---------- 5. 参数注释 ----------
+  minus <- "−"
+  fmt_num <- function(x) gsub("-", minus, as.character(x))
+  
+  label_txt <- sprintf(
+    "alpha==%s*\",\"~~theta==%s*\",\"~~M[1]==%s*\",\"~~M[2]==%s",
+    fmt_num(alpha),
+    fmt_num(theta),
+    fmt_num(M1),
+    fmt_num(M2)
+  )
+  
+  blank <- ggplot() +
+    xlim(0,1) + ylim(0,1) +
+    annotate(
+      "text",
+      x = 0.5, y = 0.5,
+      label = label_txt,
+      parse = TRUE,
+      size  = 3,
+      hjust = 0.5,
+      vjust = 0.5
+    ) +
+    theme_void() +
+    uniform_margin
+  
+  ## ---------- 6. 主 panel 布局 ----------
+  top_row <- plot_grid(
+    p_top, blank,
+    ncol = 2,
+    rel_widths = c(0.8, 0.2),
+    align = "h",
+    axis  = "tb"
+  )
+  
+  bottom_row <- plot_grid(
+    p_main, p_right,
+    ncol = 2,
+    rel_widths = c(0.8, 0.2),
+    align = "h",
+    axis  = "tb"
+  )
+  
+  final_panel <- plot_grid(
+    top_row,
+    bottom_row,
+    ncol = 1,
+    rel_heights = c(0.25, 0.75),
+    align = "v",
+    axis  = "lr"
+  )
+  
+  ## ---------- 7. weight heatmap ----------
+  p_w <- make_weight_heatmap(
+    W_list   = W_2d,
+    M1_theta = M1_theta,
+    M2_theta = M2_theta,
+    alpha    = alpha
+  )
+  
+  ## ---------- 8. 返回两个图 ----------
+  list(
+    final_panel    = final_panel,
+    weight_heatmap = p_w
+  )
+}
+
+res <- make_2d_panel_general_freebase(
+  alpha    = 1,
+  theta    = 0.5,
+  n_samp   = 2000,
+  M1_theta = 20,
+  M2_theta = 40,
+  rate0    = 1/10
+)
+
+res$final_panel
+res$weight_heatmap
+
+
+base_cdf1 <- function(x) pgamma(x, shape = 1,  scale = 10)   # dim1
+base_pdf1 <- function(x) dgamma(x, shape = 1,  scale = 10)
+
+base_cdf2 <- function(x) plnorm(x, meanlog = 1, sdlog = 0.5) # dim2
+base_pdf2 <- function(x) dlnorm(x, meanlog = 1, sdlog = 0.5)
+
+#################
+
+base_cdf1 <- function(x) pexp(x, rate = 1/10)   # dim1
+base_pdf1 <- function(x) dexp(x, rate = 1/10)
+
+base_cdf2 <- function(x)  pexp(x, rate = 1/10) # dim2
+base_pdf2 <- function(x) dexp(x, rate = 1/10)
+
+
+set.seed(11)
+p1_bivariate <- make_2d_panel_general_freebase(
+  alpha      = 1,
+  theta      = 0.2,
+  n_samp     = 2000,
+  M1_theta   = 40,
+  M2_theta   = 40,
+  ## 不用 rate0 了，直接传 base 函数
+  base_cdf1  = base_cdf1,
+  base_cdf2  = base_cdf2,
+  base_pdf1  = base_pdf1,
+  base_pdf2  = base_pdf2
+)
+set.seed(12)
+p2_bivariate <- make_2d_panel_general_freebase(
+  alpha      = 1,
+  theta      = 1,
+  n_samp     = 2000,
+  M1_theta   = 40,
+  M2_theta   = 40,
+  ## 不用 rate0 了，直接传 base 函数
+  base_cdf1  = base_cdf1,
+  base_cdf2  = base_cdf2,
+  base_pdf1  = base_pdf1,
+  base_pdf2  = base_pdf2
+)
+set.seed(13)
+p3_bivariate <- make_2d_panel_general_freebase(
+  alpha      = 100,
+  theta      = 0.2,
+  n_samp     = 2000,
+  M1_theta   = 40,
+  M2_theta   = 40,
+  ## 不用 rate0 了，直接传 base 函数
+  base_cdf1  = base_cdf1,
+  base_cdf2  = base_cdf2,
+  base_pdf1  = base_pdf1,
+  base_pdf2  = base_pdf2
+)
+set.seed(14)
+p4_bivariate <- make_2d_panel_general_freebase(
+  alpha      = 10,
+  theta      = 1,
+  n_samp     = 2000,
+  M1_theta   = 40,
+  M2_theta   = 40,
+  ## 不用 rate0 了，直接传 base 函数
+  base_cdf1  = base_cdf1,
+  base_cdf2  = base_cdf2,
+  base_pdf1  = base_pdf1,
+  base_pdf2  = base_pdf2
+)
+
+p1_bivariate$final_panel
+p1_bivariate$weight_heatmap
+
+p2_bivariate$final_panel
+p2_bivariate$weight_heatmap
+
+p3_bivariate$final_panel
+p3_bivariate$weight_heatmap
+
+p4_bivariate$final_panel
+p4_bivariate$weight_heatmap
+
+######################
+
+base_cdf1_mix <- function(x) (9/10) * pexp(x, rate = 1/20) + (1/10) *  pexp(x, rate = 1) # dim1
+base_pdf1_mix <- function(x) (9/10) * dexp(x, rate = 1/20) + (1/10) *  dexp(x, rate = 1)
+
+base_cdf2 <- function(x)  pexp(x, rate = 1/10) # dim2
+base_pdf2 <- function(x)  dexp(x, rate = 1/10)
+
+set.seed(15)
+p5_bivariate <- make_2d_panel_general_freebase(
+  alpha      = 50,
+  theta      = 0.2,
+  n_samp     = 2000,
+  M1_theta   = 40,
+  M2_theta   = 40,
+  ## 不用 rate0 了，直接传 base 函数
+  base_cdf1  = base_cdf1_mix,
+  base_cdf2  = base_cdf2,
+  base_pdf1  = base_pdf1_mix,
+  base_pdf2  = base_pdf2
+)
+p5_bivariate$final_panel
+p5_bivariate$weight_heatmap
+#######################
+
+base_cdf1_new <- function(x) pexp(x, rate = 1/100) # dim1
+base_pdf1_new <- function(x) dexp(x, rate = 1/100)
+
+base_cdf2_new <- function(x)  pexp(x, rate = 1/10) # dim2
+base_pdf2_new <- function(x)  dexp(x, rate = 1/10)
+
+set.seed(15)
+p5_bivariate <- make_2d_panel_general_freebase(
+  alpha      = 10,
+  theta      = 0.2,
+  n_samp     = 2000,
+  M1_theta   = 40,
+  M2_theta   = 40,
+  ## 不用 rate0 了，直接传 base 函数
+  base_cdf1  = base_cdf1_new,
+  base_cdf2  = base_cdf2_new,
+  base_pdf1  = base_pdf1_new,
+  base_pdf2  = base_pdf2_new
+)
+p5_bivariate$final_panel
+p5_bivariate$weight_heatmap
+
+
+
+
+
+
